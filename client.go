@@ -51,6 +51,11 @@ func runClient(peerAddress string, selfAddress string, lifespan time.Duration, s
 		log.Fatal(err)
 	}
 
+	// Confirm that the server certificate has not changed
+	if 0 != bytes.Compare(serverCert, res.TLS.PeerCertificates[0].Raw) {
+		log.Fatal("Server certificate changed! Possible security issue.")
+	}
+
 	// read and validate server provided ack
 	serverAck := clientAck{}
 	json.NewDecoder(res.Body).Decode(&serverAck)
