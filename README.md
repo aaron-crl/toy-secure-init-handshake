@@ -6,7 +6,13 @@
 - Server will listen forever
 
 # Running the toy
-To execute: `go run server.go client.go common.go`
+To execute run the below commands in separate terminals.
+
+**terminal 1**
+`go run server.go client.go common.go --selfAddress=localhost:8443 --peerAddress=localhost:8444`
+
+**terminal 2**
+`go run server.go client.go common.go --selfAddress=localhost:8444 --peerAddress=localhost:8443`
 
 This creates a server and client process and then reads the results of each's validation from the trustedPeers channel.
 

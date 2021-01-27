@@ -6,28 +6,26 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"strings"
 	"time"
 )
 
-type initNode struct {
-	ClientAddress     string
-	ClientCertificate []byte
+// PEM encoded versions of certificates for node
+type nodeInitTempCertificates struct {
+	interNodeTempCaCert      []byte
+	interNodeTempCaKey       []byte
+	interNodeTempServiceCert []byte
+	interNodeTempServiceKey  []byte
 }
 
-type serverChallenge struct {
-	ClientAddress     string
-	ClientCertificate []byte
-	Challenge         []byte
-}
-
-type clientAck struct {
-	Ack []byte
+// Blob used for symetric exchange of node public CA keys
+type signedNodeHostnameAndCa struct {
+	Hostname      string
+	CaCertificate []byte
+	HMAC          []byte
 }
 
 // helper function for hmac because go makes it
@@ -46,28 +44,25 @@ func validHmac256(message, messageMAC, key []byte) bool {
 	return hmac.Equal(messageMAC, expectedMAC)
 }
 
-// client challenge for server
-func generateServerChallenge(clientCert []byte, serverCert []byte, secretToken []byte) []byte {
-	message := append(clientCert, serverCert...)
-	return computeHmac256(message, secretToken)
-}
+// Symetric server/client CA blob signature
+func createSignedNodeHostnameAndCa(hostname string, caCert []byte, secretToken []byte) (signedMessage signedNodeHostnameAndCa) {
+	signedMessage = signedNodeHostnameAndCa{}
+	signedMessage.Hostname = hostname
+	signedMessage.CaCertificate = caCert
 
-func validateServerChallenge(challenge serverChallenge, serverCert []byte, secretToken []byte) bool {
-	expectedChallenge := append(challenge.ClientCertificate, serverCert...)
-	return validHmac256(expectedChallenge, challenge.Challenge, secretToken)
-}
+	message := append([]byte(hostname), caCert...)
+	signedMessage.HMAC = computeHmac256(message, secretToken)
 
-func generateClientAck(challenge serverChallenge, secretToken []byte) (a clientAck) {
-	a.Ack = computeHmac256(challenge.Challenge, secretToken)
 	return
 }
 
-func validateClientAck(ack clientAck, clientCert []byte, serverCert []byte, secretToken []byte) bool {
-	expectedChallenge := generateServerChallenge(clientCert, serverCert, secretToken)
-	return validHmac256(expectedChallenge, ack.Ack, secretToken)
+// Symetric validation function
+func validSignedNodeHostnameAndCa(signedMessage signedNodeHostnameAndCa, secretToken []byte) bool {
+	message := append([]byte(signedMessage.Hostname), signedMessage.CaCertificate...)
+	return validHmac256(message, signedMessage.HMAC, secretToken)
 }
 
-func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Config, err error) {
+func createNodeInitTempCertificates(hostname string, lifespan time.Duration) (certs nodeInitTempCertificates, err error) {
 	// Establish usage window
 	notBefore := time.Now()
 	notAfter := time.Now().Add(lifespan)
@@ -79,10 +74,10 @@ func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Confi
 			Organization: []string{"Cockroach Labs"},
 			Country:      []string{"US"},
 		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		IsCA:                  true,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+		IsCA:      true,
+		//ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
@@ -90,13 +85,19 @@ func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Confi
 	// create private and public key
 	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return nil, err
+		return
 	}
+
+	caPrivKeyPEM := new(bytes.Buffer)
+	pem.Encode(caPrivKeyPEM, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
+	})
 
 	// create empheral CA certificate
 	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
 	if err != nil {
-		return nil, err
+		return
 	}
 
 	// pem encode it
@@ -105,9 +106,6 @@ func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Confi
 		Type:  "CERTIFICATE",
 		Bytes: caBytes,
 	})
-
-	// extract hostname from URL
-	hostname := strings.SplitN(url, ":", 2)[0]
 
 	// bulid service template
 	cert := &x509.Certificate{
@@ -127,12 +125,12 @@ func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Confi
 
 	certPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return nil, err
+		return
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, cert, ca, &certPrivKey.PublicKey, caPrivKey)
 	if err != nil {
-		return nil, err
+		return
 	}
 
 	certPEM := new(bytes.Buffer)
@@ -147,19 +145,10 @@ func createTLSConf(url string, lifespan time.Duration) (serverTLSConf *tls.Confi
 		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
 	})
 
-	serverCert, err := tls.X509KeyPair(certPEM.Bytes(), certPrivKeyPEM.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	certpool := x509.NewCertPool()
-	certpool.AppendCertsFromPEM(caPEM.Bytes())
-
-	// TODO this should probably be populated better
-	serverTLSConf = &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		RootCAs:      certpool,
-	}
+	certs.interNodeTempCaCert = caPEM.Bytes()
+	certs.interNodeTempCaKey = caPrivKeyPEM.Bytes()
+	certs.interNodeTempServiceCert = certPEM.Bytes()
+	certs.interNodeTempServiceKey = certPrivKeyPEM.Bytes()
 
 	return
 }

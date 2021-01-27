@@ -1,20 +1,36 @@
 package main
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
-func runServer(selfAddress string, lifespan time.Duration, secretToken []byte, trustedPeers chan initNode) {
+func runServer(selfAddress string, initCerts nodeInitTempCertificates, lifespan time.Duration, secretToken []byte, trustedPeers chan signedNodeHostnameAndCa) {
 
-	serviceTLSConf, err := createTLSConf(selfAddress, lifespan)
-	if nil != err {
-		log.Fatal("Creating service TLS configuration failed")
+	// extract hostname from URL
+	hostname := strings.SplitN(selfAddress, ":", 2)[0]
+
+	serverCert, err := tls.X509KeyPair(initCerts.interNodeTempServiceCert, initCerts.interNodeTempServiceKey)
+	if err != nil {
+		log.Fatal("Failed to create server certificate key pair")
+	}
+
+	certpool := x509.NewCertPool()
+	certpool.AppendCertsFromPEM(initCerts.interNodeTempCaCert)
+
+	// TODO this should probably be populated better
+	serviceTLSConf := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		RootCAs:      certpool,
 	}
 
 	trustServer := &http.Server{
@@ -28,10 +44,8 @@ func runServer(selfAddress string, lifespan time.Duration, secretToken []byte, t
 		fmt.Fprint(res, "Hello Custom World!")
 	})
 
-	// endpoint for handling client challenges
-	http.HandleFunc("/challenge", func(res http.ResponseWriter, req *http.Request) {
-
-		challenge := serverChallenge{}
+	http.HandleFunc("/trustInit", func(res http.ResponseWriter, req *http.Request) {
+		challenge := signedNodeHostnameAndCa{}
 
 		// TODO make this more error resilient to size and shape attacks
 		err := json.NewDecoder(req.Body).Decode(&challenge)
@@ -41,28 +55,20 @@ func runServer(selfAddress string, lifespan time.Duration, secretToken []byte, t
 			return
 		}
 
-		log.Printf("Received challenge for client alleging to be: %s\n", challenge.ClientAddress)
+		log.Printf("Received challenge for client alleging to be: %s\n", challenge.Hostname)
 
-		//clientCert: I couldn't figure out how to do this with noverify so falling back on client HMAC assurances
-		// TODO: if there's a way to get the client cert here then we should do that instead of trusting the request
-		serverCert := serviceTLSConf.Certificates[0].Certificate[0]
-
-		if !validateServerChallenge(challenge, serverCert, secretToken) {
+		if !validSignedNodeHostnameAndCa(challenge, secretToken) {
 			http.Error(res, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		log.Printf("captured valid cert for %s\n", challenge.ClientAddress)
+		log.Printf("captured valid cert for %s\n", challenge.Hostname)
 
 		// send the valid node infomation to the trustedPeers channel
-		node := initNode{
-			ClientAddress:     challenge.ClientAddress,
-			ClientCertificate: challenge.ClientCertificate,
-		}
-		trustedPeers <- node
+		trustedPeers <- challenge
 
 		// acknowledge validation to client
-		ack := generateClientAck(challenge, secretToken)
+		ack := createSignedNodeHostnameAndCa(hostname, initCerts.interNodeTempCaCert, secretToken)
 		json.NewEncoder(res).Encode(ack)
 	})
 
@@ -71,25 +77,40 @@ func runServer(selfAddress string, lifespan time.Duration, secretToken []byte, t
 }
 
 func main() {
-	// hardcoded for testing
-	lifespan, err := time.ParseDuration("600s")
+	// CLI flags
+	selfAddress := flag.String("selfAddress", "localhost:8443", "listening address for node")
+	peerAddress := flag.String("peerAddress", "localhost:8443", "listening address for peer")
+	lifespanRaw := flag.String("lifespanInSeconds", "600s", "number of seconds allowed for init period")
+	secretToken := flag.String("initToken", "sUp3rSekret", "initialization passphrase")
+	flag.Parse()
+
+	lifespan, err := time.ParseDuration(*lifespanRaw)
 	if nil != err {
 		log.Fatal("Failed to parse lifespan duration")
 	}
-	selfAddress := "localhost:8443"
-	peerAddress := "localhost:8443"
-	secretToken := []byte("secretFoo")
 
-	trustedPeers := make(chan initNode)
+	selfHostname := strings.SplitN(*selfAddress, ":", 2)[0]
 
-	go runClient(peerAddress, selfAddress, lifespan, secretToken, trustedPeers)
-	go runServer(selfAddress, lifespan, secretToken, trustedPeers)
+	tempCerts, err := createNodeInitTempCertificates(selfHostname, lifespan)
+	if err != nil {
+		log.Fatal("Failed to create certificates")
+	}
+
+	trustedPeers := make(chan signedNodeHostnameAndCa)
+
+	go runClient(*peerAddress, selfHostname, tempCerts.interNodeTempCaCert, lifespan, []byte(*secretToken), trustedPeers)
+	go runServer(*selfAddress, tempCerts, lifespan, []byte(*secretToken), trustedPeers)
 
 	for p := range trustedPeers {
-		cert, err := x509.ParseCertificate(p.ClientCertificate)
-		if nil != err {
-			log.Fatal("Wait what?")
+		// remember these are now PEM encoded
+		caCert, _ := pem.Decode([]byte(p.CaCertificate))
+		if nil == caCert {
+			log.Fatal("Failed to parse valid PEM from CaCertificate blob")
 		}
-		fmt.Printf("Trusted cert for %s | Signature begins: %s...\n", p.ClientAddress, hex.EncodeToString(cert.Signature)[:12])
+		cert, err := x509.ParseCertificate(caCert.Bytes)
+		if nil != err {
+			log.Fatal("Failed to parse valid Certificate from PEM blob")
+		}
+		fmt.Printf("Trusted cert for %s | Signature begins: %s...\n", p.Hostname, hex.EncodeToString(cert.Signature)[:12])
 	}
 }

@@ -2,72 +2,66 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
 )
 
-func runClient(peerAddress string, selfAddress string, lifespan time.Duration, secretToken []byte, trustedPeers chan initNode) {
-	serviceTLSConf, err := createTLSConf(selfAddress, lifespan)
-	if nil != err {
-		log.Fatal("Creating service TLS configuration failed")
-	}
+func getPeerCaCert(peerAddress string, selfHostname string, selfCaCert []byte, secretToken []byte) (peerCaCertAndHostname signedNodeHostnameAndCa, err error) {
+	err = nil
 
-	serviceTLSConf.InsecureSkipVerify = true
+	// TODO(aaron-crl): add TLS protocol level checks to make sure remote certificate matches profered one
+	// This is non critical due to HMAC but would be good hygiene
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: serviceTLSConf,
-		},
-	}
+	// connect to HTTPS endpoint unverified (effectively HTTP) with POST of challenge
+	// HMAC(hostname + node CA public certificate, secretToken)
+	clientTransport := http.DefaultTransport.(*http.Transport).Clone()
+	clientTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	client := &http.Client{Transport: clientTransport}
 
-	// TODO replace this with a retry loop
-	time.Sleep(5 * time.Second)
+	challenge := createSignedNodeHostnameAndCa(selfHostname, selfCaCert, secretToken)
 
-	// make initial connection to get server certificate
-	conn, err := client.Get("https://" + peerAddress)
-	if nil != err {
-		log.Fatal(err)
-	}
-
-	// extract client and server certs for next steps
-	clientCert := serviceTLSConf.Certificates[0].Certificate[0]
-	serverCert := conn.TLS.PeerCertificates[0].Raw
-
-	// generate challenge for the server
-	sChallenge := generateServerChallenge(clientCert, serverCert, secretToken)
-	challenge := serverChallenge{
-		ClientAddress:     selfAddress,
-		ClientCertificate: clientCert,
-		Challenge:         sChallenge,
-	}
-
+	// Poll until valid or timeout
 	body := new(bytes.Buffer)
 	json.NewEncoder(body).Encode(challenge)
-	res, err := client.Post("https://"+peerAddress+"/challenge", "application/json; charset=utf-8", body)
+	res, err := client.Post("https://"+peerAddress+"/trustInit", "application/json; charset=utf-8", body)
 	if nil != err {
-		log.Fatal(err)
+		return
 	}
-
-	// Confirm that the server certificate has not changed
-	if 0 != bytes.Compare(serverCert, res.TLS.PeerCertificates[0].Raw) {
-		log.Fatal("Server certificate changed! Possible security issue.")
-	}
+	defer res.Body.Close()
 
 	// read and validate server provided ack
-	serverAck := clientAck{}
+	// HMAC(hostname + server CA public certificate, secretToken)
+	serverAck := signedNodeHostnameAndCa{}
 	json.NewDecoder(res.Body).Decode(&serverAck)
-	if !validateClientAck(serverAck, clientCert, serverCert, secretToken) {
-		log.Fatal("Failed to validate server certificate")
+
+	// confirm response HMAC, if valid return peer bundle
+	if !validSignedNodeHostnameAndCa(serverAck, secretToken) {
+		log.Fatal("Failed to validate server response")
 	}
 
-	node := initNode{
-		ClientAddress:     peerAddress,
-		ClientCertificate: serverCert,
-	}
-	trustedPeers <- node
+	peerCaCertAndHostname = serverAck
 
-	fmt.Println("Client Success")
+	return
+}
+
+func runClient(peerHostname string, selfHostname string, selfCaCert []byte, lifespan time.Duration, secretToken []byte, trustedPeers chan signedNodeHostnameAndCa) {
+
+	// retry for lifespan of certificates
+	for start := time.Now(); time.Since(start) < lifespan; {
+		peerHostnameAndCa, err := getPeerCaCert(peerHostname, selfHostname, selfCaCert, secretToken)
+		if nil == err {
+			trustedPeers <- peerHostnameAndCa
+			log.Printf("Successfully established trust with peer: %s\n", peerHostnameAndCa.Hostname)
+			return
+		} else {
+			// sleep for 1 second between attempts
+			log.Printf("Error connected to peer (%s): %s", peerHostname, err)
+			time.Sleep(time.Second)
+		}
+	}
+
+	log.Fatal("Lifespan of secret expired before node trust established.")
 }
