@@ -56,11 +56,11 @@ func runClient(peerHostname string, selfHostname string, selfCaCert []byte, life
 			trustedPeers <- peerHostnameAndCa
 			log.Printf("Successfully established trust with peer: %s\n", peerHostnameAndCa.Hostname)
 			return
-		} else {
-			// sleep for 1 second between attempts
-			log.Printf("Error connected to peer (%s): %s", peerHostname, err)
-			time.Sleep(time.Second)
 		}
+
+		// sleep for 1 second between attempts
+		log.Printf("Error connected to peer (%s): %s", peerHostname, err)
+		time.Sleep(time.Second)
 	}
 
 	log.Fatal("Lifespan of secret expired before node trust established.")
