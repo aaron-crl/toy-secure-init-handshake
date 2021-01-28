@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
-func getPeerCaCert(peerAddress string, selfHostname string, selfCaCert []byte, secretToken []byte) (peerCaCertAndHostname signedNodeHostnameAndCa, err error) {
+func getPeerCaCert(peerAddress string, selfAddress string, selfCaCert []byte, secretToken []byte) (peerCaCertAndHostname signedNodeHostnameAndCa, err error) {
 	err = nil
 
-	// TODO(aaron-crl): add TLS protocol level checks to make sure remote certificate matches profered one
+	selfHostname := strings.SplitN(selfAddress, ":", 2)[0]
+
+	// TODO(aaron-crl): [Enhancement] add TLS protocol level checks to make sure remote certificate matches profered one
 	// This is non critical due to HMAC but would be good hygiene
 
 	// connect to HTTPS endpoint unverified (effectively HTTP) with POST of challenge
@@ -22,6 +25,7 @@ func getPeerCaCert(peerAddress string, selfHostname string, selfCaCert []byte, s
 	client := &http.Client{Transport: clientTransport}
 
 	challenge := createSignedNodeHostnameAndCa(selfHostname, selfCaCert, secretToken)
+	challenge.HostAddress = selfAddress
 
 	// Poll until valid or timeout
 	body := new(bytes.Buffer)
@@ -47,19 +51,20 @@ func getPeerCaCert(peerAddress string, selfHostname string, selfCaCert []byte, s
 	return
 }
 
-func runClient(peerHostname string, selfHostname string, selfCaCert []byte, lifespan time.Duration, secretToken []byte, trustedPeers chan signedNodeHostnameAndCa) {
+func runClient(peerHostname string, selfAddress string, selfCaCert []byte, lifespan time.Duration, secretToken []byte, trustedPeers chan signedNodeHostnameAndCa) {
 
 	// retry for lifespan of certificates
 	for start := time.Now(); time.Since(start) < lifespan; {
-		peerHostnameAndCa, err := getPeerCaCert(peerHostname, selfHostname, selfCaCert, secretToken)
+		peerHostnameAndCa, err := getPeerCaCert(peerHostname, selfAddress, selfCaCert, secretToken)
 		if nil == err {
+			// write trusted cert and exit
 			trustedPeers <- peerHostnameAndCa
 			log.Printf("Successfully established trust with peer: %s\n", peerHostnameAndCa.Hostname)
 			return
 		}
 
 		// sleep for 1 second between attempts
-		log.Printf("Error connected to peer (%s): %s", peerHostname, err)
+		log.Printf("Error connecting to peer (%s): %s", peerHostname, err)
 		time.Sleep(time.Second)
 	}
 
